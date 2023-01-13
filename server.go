@@ -404,7 +404,7 @@ func Serve(opts *ServeConfig) {
 	// bring it up. In test mode, we don't do this because clients will
 	// attach via a reattach config.
 	if opts.Test == nil {
-		fmt.Printf("%d|%d|%s|%s|%s|%s\n",
+		fmt.Printf("\n%d|%d|%s|%s|%s|%s\n",
 			CoreProtocolVersion,
 			protoVersion,
 			listener.Addr().Network(),

@@ -217,6 +217,10 @@ type ClientConfig struct {
 	// to create gRPC connections. This only affects plugins using the gRPC
 	// protocol.
 	GRPCDialOptions []grpc.DialOption
+
+	// LooseNegotiation if set to ture, will allow client read negotiation message
+	// in any line of stdout of plugin.
+	LooseNegotiation bool
 }
 
 // ReattachConfig is used to configure a client to reattach to an
@@ -491,6 +495,88 @@ var peTypes = map[uint16]string{
 	0xaa64: "arm64",
 }
 
+func (c *Client) parseNegotiationMessage(line string) (addr net.Addr, err error) {
+	// Trim the line and split by "|" in order to get the parts of
+	// the output.
+	line = strings.TrimSpace(line)
+	parts := strings.SplitN(line, "|", 6)
+	if len(parts) < 4 {
+		err = fmt.Errorf(unrecognizedRemotePluginMessage, line, additionalNotesAboutCommand(c.config.Cmd.Path))
+		return
+	}
+
+	// Check the core protocol. Wrapped in a {} for scoping.
+	{
+		var coreProtocol int
+		coreProtocol, err = strconv.Atoi(parts[0])
+		if err != nil {
+			err = fmt.Errorf("Error parsing core protocol version: %s", err)
+			return
+		}
+
+		if coreProtocol != CoreProtocolVersion {
+			err = fmt.Errorf("Incompatible core API version with plugin. "+
+				"Plugin version: %s, Core version: %d\n\n"+
+				"To fix this, the plugin usually only needs to be recompiled.\n"+
+				"Please report this to the plugin author.", parts[0], CoreProtocolVersion)
+			return
+		}
+	}
+
+	// Test the API version
+	version, pluginSet, err := c.checkProtoVersion(parts[1])
+	if err != nil {
+		return addr, err
+	}
+
+	// set the Plugins value to the compatible set, so the version
+	// doesn't need to be passed through to the ClientProtocol
+	// implementation.
+	c.config.Plugins = pluginSet
+	c.negotiatedVersion = version
+	c.logger.Debug("using plugin", "version", version)
+
+	switch parts[2] {
+	case "tcp":
+		addr, err = net.ResolveTCPAddr("tcp", parts[3])
+	case "unix":
+		addr, err = net.ResolveUnixAddr("unix", parts[3])
+	default:
+		err = fmt.Errorf("Unknown address type: %s", parts[3])
+	}
+
+	// If we have a server type, then record that. We default to net/rpc
+	// for backwards compatibility.
+	c.protocol = ProtocolNetRPC
+	if len(parts) >= 5 {
+		c.protocol = Protocol(parts[4])
+	}
+
+	found := false
+	for _, p := range c.config.AllowedProtocols {
+		if p == c.protocol {
+			found = true
+			break
+		}
+	}
+	if !found {
+		err = fmt.Errorf("Unsupported plugin protocol %q. Supported: %v",
+			c.protocol, c.config.AllowedProtocols)
+		return addr, err
+	}
+
+	// See if we have a TLS certificate from the server.
+	// Checking if the length is > 50 rules out catching the unused "extra"
+	// data returned from some older implementations.
+	if len(parts) >= 6 && len(parts[5]) > 50 {
+		err := c.loadServerCert(parts[5])
+		if err != nil {
+			return nil, fmt.Errorf("error parsing server cert: %s", err)
+		}
+	}
+	return addr, err
+}
+
 // Start the underlying subprocess, communicating with it to negotiate
 // a port for RPC connections, and returning the address to connect via RPC.
 //
@@ -704,94 +790,29 @@ func (c *Client) Start() (addr net.Addr, err error) {
 
 	// Start looking for the address
 	c.logger.Debug("waiting for RPC address", "path", cmd.Path)
-	select {
-	case <-timeout:
-		err = errors.New("timeout while waiting for plugin to start")
-	case <-c.doneCtx.Done():
-		err = errors.New("plugin exited before we could connect")
-	case line := <-linesCh:
-		// Trim the line and split by "|" in order to get the parts of
-		// the output.
-		line = strings.TrimSpace(line)
-		parts := strings.SplitN(line, "|", 6)
-		if len(parts) < 4 {
-			err = fmt.Errorf(unrecognizedRemotePluginMessage, line, additionalNotesAboutCommand(cmd.Path))
-			return
-		}
-
-		// Check the core protocol. Wrapped in a {} for scoping.
-		{
-			var coreProtocol int
-			coreProtocol, err = strconv.Atoi(parts[0])
+	for {
+		select {
+		case <-timeout:
+			err = errors.New("timeout while waiting for plugin to start")
+			return nil, err
+		case <-c.doneCtx.Done():
+			err = errors.New("plugin exited before we could connect")
+			return nil, err
+		case line := <-linesCh:
+			addr, err = c.parseNegotiationMessage(line)
 			if err != nil {
-				err = fmt.Errorf("Error parsing core protocol version: %s", err)
-				return
-			}
-
-			if coreProtocol != CoreProtocolVersion {
-				err = fmt.Errorf("Incompatible core API version with plugin. "+
-					"Plugin version: %s, Core version: %d\n\n"+
-					"To fix this, the plugin usually only needs to be recompiled.\n"+
-					"Please report this to the plugin author.", parts[0], CoreProtocolVersion)
-				return
-			}
-		}
-
-		// Test the API version
-		version, pluginSet, err := c.checkProtoVersion(parts[1])
-		if err != nil {
-			return addr, err
-		}
-
-		// set the Plugins value to the compatible set, so the version
-		// doesn't need to be passed through to the ClientProtocol
-		// implementation.
-		c.config.Plugins = pluginSet
-		c.negotiatedVersion = version
-		c.logger.Debug("using plugin", "version", version)
-
-		switch parts[2] {
-		case "tcp":
-			addr, err = net.ResolveTCPAddr("tcp", parts[3])
-		case "unix":
-			addr, err = net.ResolveUnixAddr("unix", parts[3])
-		default:
-			err = fmt.Errorf("Unknown address type: %s", parts[3])
-		}
-
-		// If we have a server type, then record that. We default to net/rpc
-		// for backwards compatibility.
-		c.protocol = ProtocolNetRPC
-		if len(parts) >= 5 {
-			c.protocol = Protocol(parts[4])
-		}
-
-		found := false
-		for _, p := range c.config.AllowedProtocols {
-			if p == c.protocol {
-				found = true
-				break
-			}
-		}
-		if !found {
-			err = fmt.Errorf("Unsupported plugin protocol %q. Supported: %v",
-				c.protocol, c.config.AllowedProtocols)
-			return addr, err
-		}
-
-		// See if we have a TLS certificate from the server.
-		// Checking if the length is > 50 rules out catching the unused "extra"
-		// data returned from some older implementations.
-		if len(parts) >= 6 && len(parts[5]) > 50 {
-			err := c.loadServerCert(parts[5])
-			if err != nil {
-				return nil, fmt.Errorf("error parsing server cert: %s", err)
+				if c.config.LooseNegotiation {
+					// if LooseNegotiation is true, just log and wait for next message
+					c.logger.Warn(err.Error())
+				} else {
+					return nil, err
+				}
+			} else {
+				c.address = addr
+				return addr, nil
 			}
 		}
 	}
-
-	c.address = addr
-	return
 }
 
 // loadServerCert is used by AutoMTLS to read an x.509 cert returned by the
