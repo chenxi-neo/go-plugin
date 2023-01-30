@@ -799,17 +799,20 @@ func (c *Client) Start() (addr net.Addr, err error) {
 			err = errors.New("plugin exited before we could connect")
 			return nil, err
 		case line := <-linesCh:
-			addr, err = c.parseNegotiationMessage(line)
-			if err != nil {
-				if c.config.LooseNegotiation {
-					// if LooseNegotiation is true, just log and wait for next message
-					c.logger.Warn(err.Error())
+			// Avoid redundant empty string if plugin bootstrap failed
+			if line != "" {
+				addr, err = c.parseNegotiationMessage(line)
+				if err != nil {
+					if c.config.LooseNegotiation {
+						// if LooseNegotiation is true, just log and wait for next message
+						c.logger.Warn(err.Error())
+					} else {
+						return nil, err
+					}
 				} else {
-					return nil, err
+					c.address = addr
+					return addr, nil
 				}
-			} else {
-				c.address = addr
-				return addr, nil
 			}
 		}
 	}
